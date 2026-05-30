@@ -1,0 +1,2 @@
+# Co-occurrence_Network_for_Twitter
+Twitterデータアーカイブをベースとした共起ネットワーク図作成システム
