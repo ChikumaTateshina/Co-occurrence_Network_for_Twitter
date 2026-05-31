@@ -372,6 +372,10 @@ class TweetCooccurrenceNetwork:
     ) -> None:
         """グラデーション・グロー付きダークモードネットワーク図を保存する"""
 
+        if G.number_of_nodes() == 0:
+            print("グラフにノードがありません。min_appearance / min_cooccurrence を下げて再実行してください。")
+            return
+
         # ---- コミュニティ検出（凡例なし・色分けのみ） ----
         # scipy あり → greedy_modularity_communities、なし → label_propagation（常に実行）
         if G.number_of_edges() > 0:
@@ -398,7 +402,7 @@ class TweetCooccurrenceNetwork:
         node_list = list(G.nodes())
         degrees = dict(G.degree())
         max_degree = max(degrees.values()) if degrees else 1
-        max_count = max(word_counts[n] for n in node_list)
+        max_count = max((word_counts[n] for n in node_list), default=1)
 
         scores = {
             n: 0.6 * (degrees[n] / max_degree) + 0.4 * (word_counts[n] / max_count)
