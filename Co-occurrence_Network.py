@@ -407,17 +407,24 @@ class TweetCooccurrenceNetwork:
         min_appearance: int = 5,
         top_n_edges: int = 50,
         min_cooccurrence: int = 3,
+        include_rt: bool = True,
     ) -> tuple[nx.Graph, Counter]:
         """Jaccard 係数で重み付けした共起グラフを構築し解析統計を表示する"""
+        total = len(tweets)
+        rt_count = sum(1 for t in tweets if t.startswith("RT "))
+
+        if not include_rt:
+            tweets = [t for t in tweets if not t.startswith("RT ")]
+
         word_sets = [self._extract_nouns(t) for t in tweets]
 
-        rt_count = sum(1 for t in tweets if t.startswith("RT "))
         with_any_noun = sum(1 for w in word_sets if len(w) >= 1)
         with_pair = sum(1 for w in word_sets if len(w) >= 2)
 
-        print(f"  読み込み:            {len(tweets):>6}件")
-        print(f"    うち RT:           {rt_count:>6}件")
-        print(f"    うちオリジナル:    {len(tweets) - rt_count:>6}件")
+        print(f"  読み込み:            {total:>6}件")
+        print(f"    うち RT:           {rt_count:>6}件{'（除外）' if not include_rt else '（含む）'}")
+        print(f"    うちオリジナル:    {total - rt_count:>6}件")
+        print(f"  解析対象合計:        {len(tweets):>6}件")
         print(f"  名詞なし / 空白:     {len(tweets) - with_any_noun:>6}件")
         print(f"  名詞 1 語のみ:       {with_any_noun - with_pair:>6}件  ← 共起ペア生成不可")
         print(f"  共起解析対象:        {with_pair:>6}件  ← グラフへ寄与")
@@ -682,6 +689,10 @@ if __name__ == "__main__":
     # lang: "auto"（日本語↔英語を自動判定） / "ja" / "en" / "both"（バイリンガル）
     LANG = "both"
 
+    # True: リツイートも解析対象に含む（デフォルト）
+    # False: オリジナルツイートのみ解析
+    INCLUDE_RT = True
+
     try:
         analyzer = TweetCooccurrenceNetwork(FILE_PATH, lang=LANG)
         print("\nツイートデータを読み込んでいます...")
@@ -694,6 +705,7 @@ if __name__ == "__main__":
             min_appearance=3,
             top_n_edges=350,
             min_cooccurrence=3,
+            include_rt=INCLUDE_RT,
         )
 
         # 共起解析対象が0件の場合に診断情報を表示
