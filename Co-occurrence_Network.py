@@ -42,11 +42,44 @@ except ImportError:
     _MeCab = None  # type: ignore[assignment]
     _MECAB_AVAILABLE = False
 
+# NLTK による英語名詞抽出（未インストール時はスキップ）
+# インストール: pip install nltk
+try:
+    import nltk as _nltk  # type: ignore[import]
+    from nltk.tokenize import word_tokenize as _word_tokenize  # type: ignore[import]
+    from nltk.tag import pos_tag as _pos_tag  # type: ignore[import]
+
+    def _ensure_nltk_data() -> None:
+        for resource, pkg in [
+            ("tokenizers/punkt_tab", "punkt_tab"),
+            ("tokenizers/punkt",     "punkt"),
+            ("taggers/averaged_perceptron_tagger_eng", "averaged_perceptron_tagger_eng"),
+            ("taggers/averaged_perceptron_tagger",     "averaged_perceptron_tagger"),
+        ]:
+            try:
+                _nltk.data.find(resource)
+                return  # 見つかれば終了
+            except LookupError:
+                try:
+                    _nltk.download(pkg, quiet=True)
+                except Exception:
+                    pass
+
+    _ensure_nltk_data()
+    _NLTK_AVAILABLE = True
+except ImportError:
+    _nltk = None  # type: ignore[assignment]
+    _word_tokenize = None  # type: ignore[assignment]
+    _pos_tag = None  # type: ignore[assignment]
+    _NLTK_AVAILABLE = False
+
 # ---- 正規表現（モジュールレベルで事前コンパイル） ----
 _RE_URL = re.compile(r"https?://\S+")
 _RE_MENTION = re.compile(r"@\w+")
 _RE_HASHTAG = re.compile(r"#\w+")
 _RE_RT_PREFIX = re.compile(r"^RT\s+@\w+:\s*")
+# 日本語文字（ひらがな・カタカナ・CJK漢字）の検出
+_RE_JP = re.compile(r"[぀-ヿ一-鿿＀-￯]")
 
 # ---- 定数 ----
 _DEFAULT_STOP_WORDS: frozenset[str] = frozenset({
@@ -56,6 +89,20 @@ _DEFAULT_STOP_WORDS: frozenset[str] = frozenset({
     "ツイート", "リツイート",
 })
 _EXCLUDED_NOUN_SUBTYPES: frozenset[str] = frozenset({"代名詞", "非自立", "特殊", "数"})
+
+_EN_STOP_WORDS: frozenset[str] = frozenset({
+    "i", "me", "my", "we", "our", "you", "your", "he", "him", "his",
+    "she", "her", "it", "its", "they", "them", "their", "what", "which",
+    "who", "whom", "this", "that", "these", "those", "am", "is", "are",
+    "was", "were", "be", "been", "being", "have", "has", "had", "do",
+    "does", "did", "will", "would", "shall", "should", "may", "might",
+    "must", "can", "could", "a", "an", "the", "and", "but", "if", "or",
+    "as", "of", "at", "by", "for", "with", "about", "into", "through",
+    "to", "from", "up", "in", "out", "on", "off", "then", "here", "there",
+    "when", "where", "why", "how", "all", "both", "each", "more", "most",
+    "no", "not", "only", "same", "so", "than", "too", "very", "just",
+    "now", "rt", "tweet", "retweet", "via", "amp",
+})
 
 # 白背景色
 _BG = (1.0, 1.0, 1.0, 1.0)  # 白 RGBA
@@ -210,22 +257,41 @@ class TweetCooccurrenceNetwork:
         file_path: str | Path,
         stop_words: Optional[frozenset[str]] = None,
         use_mecab: bool = True,
+        lang: str = "auto",
     ) -> None:
+        """
+        lang:
+          "auto"  ツイートごとに日本語文字の有無で自動判定（デフォルト）
+          "ja"    常に日本語形態素解析
+          "en"    常に英語 NLTK 解析
+          "both"  日英両方で抽出して合算（バイリンガルアカウント向け）
+        """
         self.file_path = Path(file_path)
         self.stop_words = stop_words if stop_words is not None else _DEFAULT_STOP_WORDS
+
+        if lang not in ("auto", "ja", "en", "both"):
+            raise ValueError(f"lang は 'auto' / 'ja' / 'en' / 'both' のいずれかを指定してください: {lang!r}")
+        self._lang = lang
 
         self._use_mecab = use_mecab and _MECAB_AVAILABLE
         if self._use_mecab:
             self._tagger = _MeCab.Tagger()
             self._tagger.parse("")  # 初回遅延を防ぐウォームアップ
-            print("形態素解析エンジン: MeCab")
+            print("形態素解析エンジン (日本語): MeCab")
         else:
             self._janome = Tokenizer()
             if use_mecab and not _MECAB_AVAILABLE:
-                print("形態素解析エンジン: Janome（MeCab 未インストールのためフォールバック）")
+                print("形態素解析エンジン (日本語): Janome（MeCab 未インストールのためフォールバック）")
                 print("  MeCab を使用する場合: pip install mecab-python3")
             else:
-                print("形態素解析エンジン: Janome")
+                print("形態素解析エンジン (日本語): Janome")
+
+        if lang in ("en", "both", "auto"):
+            if _NLTK_AVAILABLE:
+                print("形態素解析エンジン (英語): NLTK")
+            elif lang in ("en", "both"):
+                print("警告: NLTK が未インストールのため英語抽出が無効です。")
+                print("  インストール: pip install nltk")
 
     def load_tweets(self) -> list[str]:
         """tweets.js 内の全ツイートの full_text を返す（RT を含む）"""
@@ -280,10 +346,60 @@ class TweetCooccurrenceNetwork:
                 result.append(base)
         return result
 
-    def _extract_nouns(self, text: str) -> list[str]:
+    def _extract_nouns_english(self, text: str) -> list[str]:
+        """NLTK で英語名詞（NN/NNS/NNP/NNPS）を抽出して小文字で返す"""
+        if not _NLTK_AVAILABLE:
+            return []
+        cleaned = self._clean(text)
+        if not cleaned:
+            return []
+        try:
+            tokens = _word_tokenize(cleaned)
+            tagged = _pos_tag(tokens)
+        except Exception:
+            return []
+        seen: set[str] = set()
+        result: list[str] = []
+        for word, tag in tagged:
+            if not tag.startswith("NN"):
+                continue
+            w = word.lower()
+            if (len(w) >= 2
+                    and w.isalpha()
+                    and w not in _EN_STOP_WORDS
+                    and w not in self.stop_words
+                    and w not in seen):
+                seen.add(w)
+                result.append(w)
+        return result
+
+    def _extract_nouns_ja(self, text: str) -> list[str]:
+        """日本語形態素解析エンジンで名詞を抽出する"""
         if self._use_mecab:
             return self._extract_nouns_mecab(text)
         return self._extract_nouns_janome(text)
+
+    def _extract_nouns(self, text: str) -> list[str]:
+        cleaned = self._clean(text)
+        if not cleaned:
+            return []
+
+        if self._lang == "ja":
+            return self._extract_nouns_ja(text)
+
+        if self._lang == "en":
+            return self._extract_nouns_english(text)
+
+        is_japanese = bool(_RE_JP.search(cleaned))
+
+        if self._lang == "auto":
+            return self._extract_nouns_ja(text) if is_japanese else self._extract_nouns_english(text)
+
+        # "both": 日英両方を抽出して重複除去
+        ja_nouns = self._extract_nouns_ja(text) if is_japanese else []
+        en_nouns = self._extract_nouns_english(text)
+        seen = set(ja_nouns)
+        return ja_nouns + [w for w in en_nouns if w not in seen]
 
     def build_graph(
         self,
@@ -547,10 +663,27 @@ class TweetCooccurrenceNetwork:
         print(f"ネットワーク図を {output_path} として保存しました。")
 
 
+def _diagnose(analyzer: "TweetCooccurrenceNetwork", tweets: list[str], n: int = 5) -> None:
+    """データが0件になる原因を診断する"""
+    print("\n--- 診断モード ---")
+    print(f"サンプル（先頭 {n} 件）:")
+    for i, t in enumerate(tweets[:n]):
+        cleaned = analyzer._clean(t)
+        nouns = analyzer._extract_nouns(t)
+        print(f"  [{i+1}] 元テキスト: {t[:80]!r}")
+        print(f"       クリーン後: {cleaned[:80]!r}")
+        print(f"       抽出名詞:   {nouns}")
+    print("-------------------\n")
+
+
 if __name__ == "__main__":
     FILE_PATH = "tweets.js"
+
+    # lang: "auto"（日本語↔英語を自動判定） / "ja" / "en" / "both"（バイリンガル）
+    LANG = "both"
+
     try:
-        analyzer = TweetCooccurrenceNetwork(FILE_PATH)
+        analyzer = TweetCooccurrenceNetwork(FILE_PATH, lang=LANG)
         print("\nツイートデータを読み込んでいます...")
         tweets = analyzer.load_tweets()
         print(f"読み込みツイート数: {len(tweets)}件\n")
@@ -562,6 +695,10 @@ if __name__ == "__main__":
             top_n_edges=350,
             min_cooccurrence=3,
         )
+
+        # 共起解析対象が0件の場合に診断情報を表示
+        if G.number_of_nodes() == 0:
+            _diagnose(analyzer, tweets)
 
         print("\nネットワーク図を描画中...")
         analyzer.visualize(G, word_counts)
